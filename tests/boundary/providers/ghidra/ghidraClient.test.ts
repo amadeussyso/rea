@@ -31,6 +31,7 @@ import { createTestTempDirectory } from "../../../fixtures/temporaryDirectory.js
 const fixturePath = fileURLToPath(
   new URL("../../../fixtures/fakeGhidra.mjs", import.meta.url),
 );
+
 const PROFILE_DIGEST = "a".repeat(64);
 const PROVIDER_VERSION = "12.1.4";
 const TARGET_SHA256 = createHash("sha256")
@@ -40,6 +41,8 @@ const HOST_TRANSPORT: GhidraTransportKind =
   process.platform === "win32" ? "authenticated-loopback-tcp" : "unix-socket";
 
 type FixtureMode =
+  | "reject_first_connection"
+  | "reject_all_connections"
   | "success"
   | "fragmented"
   | "oversized_result"
@@ -148,6 +151,26 @@ const clientFor = (
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(clients.splice(0).map((client) => client.close()));
+});
+
+describe("GhidraClient ready-only dispatch", () => {
+  it("does not start cold and preserves the normal result once ready", async () => {
+    const launcher = new FixtureLauncher();
+    const client = clientFor(launcher);
+
+    await expect(client.callToolIfReady("list_strings", {})).resolves.toBe(
+      undefined,
+    );
+    expect(launcher.processes).toEqual([]);
+
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    await expect(client.callToolIfReady("list_strings", {})).resolves.toEqual({
+      ok: true,
+      value: [expect.objectContaining({ value: "fixture value" })],
+    });
+    expect(launcher.processes).toHaveLength(1);
+  });
 });
 
 it("reports unknown startup work and stops notifications when cancellation releases the process", async () => {
@@ -1111,3 +1134,30 @@ describe.skipIf(process.platform === "win32")(
     );
   },
 );
+
+it("reconnects a dropped preauthentication loopback socket within the original startup deadline", async () => {
+  const launcher = new FixtureLauncher("reject_first_connection");
+  const client = clientFor(launcher, {
+    transport: "authenticated-loopback-tcp",
+  });
+  const started = await client.start();
+  expect(started.ok).toBe(true);
+  expect(launcher.processes).toHaveLength(1);
+  const result = await client.callToolIfReady("list_strings", {});
+  expect(result).toMatchObject({ ok: true });
+});
+
+it("bounds retries when loopback preauthentication keeps failing", async () => {
+  const launcher = new FixtureLauncher("reject_all_connections");
+  const client = clientFor(launcher, {
+    transport: "authenticated-loopback-tcp",
+  });
+  expect(await client.start()).toMatchObject({
+    ok: false,
+    error: { kind: "process" },
+  });
+  expect(launcher.processes).toHaveLength(1);
+  await expect(waitForChildExit(launcher.processes[0]!, 5_000)).resolves.toBe(
+    true,
+  );
+});

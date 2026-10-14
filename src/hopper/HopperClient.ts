@@ -44,11 +44,13 @@ import {
   type ProviderProcessDiagnostic,
   ProviderProcessSupervisor,
 } from "../process/ProviderProcess.js";
+import { observeProcessStartIdentity } from "../process/ProcessOwnershipObservation.js";
 import type { BridgeLaunch, BridgeLauncher } from "./BridgeLauncher.js";
 import { hopperOperationStage } from "./HopperOperationStage.js";
 import type { HopperDiagnostic } from "./HopperDiagnostics.js";
 import {
   cleanupHopperSession,
+  confirmExternalApplicationExit,
   type HopperOwnedResources,
 } from "./HopperCleanup.js";
 import {
@@ -59,6 +61,7 @@ import {
 import { connectHopperSocketOnce } from "./HopperSocketConnection.js";
 import {
   hopperLauncherFailureDiagnostic,
+  hopperLauncherReportedApplicationNotFound,
   nativeHopperLaunchWasDenied,
 } from "./HopperProcessDiagnostic.js";
 import { DEFAULT_HOPPER_STARTUP_TIMEOUT_MS } from "../config/providerStartupTimeout.js";
@@ -112,6 +115,7 @@ export class HopperClient {
     processSupervisor: undefined,
     runtimeRoot: undefined,
     shutdownConfirmed: false,
+    externalApplication: undefined,
   };
   #token: string | undefined;
   readonly #lineage = new ProviderRunLineage();
@@ -121,6 +125,7 @@ export class HopperClient {
   #launcherFailureDiagnostic: HopperStartupFailureDiagnostic | undefined;
   #operationFailure: OperationFailureRecord | undefined;
   #startupController: AbortController | undefined;
+  #ready = false;
   #startupFailureResult: AnalysisError | undefined;
   #runId: string | undefined;
   #startPromise: Promise<Result<HopperServerInfo, AnalysisError>> | undefined;
@@ -257,6 +262,16 @@ export class HopperClient {
     };
   }
 
+  /** True only after the authenticated health handshake has completed. */
+  isReady(): boolean {
+    return (
+      this.#ready &&
+      this.#socket !== undefined &&
+      !this.#socket.destroyed &&
+      this.#closePromise === undefined
+    );
+  }
+
   /** Launch the bridge once and complete its authenticated health handshake. */
   start(
     signal?: AbortSignal,
@@ -292,7 +307,7 @@ export class HopperClient {
         if (!result.ok) {
           this.#rememberStartupFailure(result.error);
           reset();
-        }
+        } else this.#ready = true;
       },
       (cause: unknown) => {
         this.#logger.debug(
@@ -422,6 +437,27 @@ export class HopperClient {
     }
     const parsed = parseHopperServerInfo(health.value, runId);
     if (!parsed.ok) return this.#startupFailure(parsed.error);
+    if (this.#resources.launch?.providerLifetime === "external-application") {
+      let identity;
+      try {
+        identity = await observeProcessStartIdentity(parsed.value.processId);
+      } catch (cause: unknown) {
+        identity = {
+          state: "unavailable" as const,
+          reason:
+            cause instanceof Error
+              ? cause.message
+              : "process identity observation failed",
+        };
+      }
+      this.#resources.externalApplication = {
+        pid: parsed.value.processId,
+        identity: identity ?? {
+          state: "unavailable",
+          reason: "process identity was not returned while Hopper was running",
+        },
+      };
+    }
     await this.#lineage.observe(this.#resources.launch);
     return parsed;
   }
@@ -466,7 +502,28 @@ export class HopperClient {
   ): Promise<Result<JsonValue, AnalysisError>> {
     const started = await this.start(options.signal);
     if (!started.ok) return started;
-    const result = await this.#request(name, arguments_, options);
+    return this.#normalizeToolResult(
+      name,
+      await this.#request(name, arguments_, options),
+    );
+  }
+
+  /** Dispatch against the connected bridge without invoking startup or retry. */
+  callToolIfReady(
+    name: string,
+    arguments_: Readonly<Record<string, JsonValue>> = {},
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<Result<JsonValue, AnalysisError> | undefined> {
+    if (!this.isReady()) return Promise.resolve(undefined);
+    return this.#request(name, arguments_, options).then((result) =>
+      this.#normalizeToolResult(name, result),
+    );
+  }
+
+  #normalizeToolResult(
+    name: string,
+    result: Result<JsonValue, AnalysisError>,
+  ): Result<JsonValue, AnalysisError> {
     return !result.ok &&
       result.error instanceof HopperRemoteError &&
       result.error.diagnosticType === "capability_unavailable"
@@ -502,6 +559,9 @@ export class HopperClient {
       // best-effort cleanup: a rejected startup must not mask close/cleanup;
       // #cleanup reports the authoritative close result.
       await starting?.catch(() => undefined);
+      await confirmExternalApplicationExit(this.#resources, this.#socket, () =>
+        this.#releaseTransport(),
+      );
       await this.#reconnectForCleanup();
       return await this.#cleanup(options);
     } finally {
@@ -579,6 +639,7 @@ export class HopperClient {
     options: HopperClientCloseOptions = {},
   ): Promise<Result<null, AnalysisError>> {
     this.#closing = true;
+    this.#ready = false;
     try {
       return await cleanupHopperSession({
         socket: this.#socket,
@@ -732,6 +793,17 @@ export class HopperClient {
       return new HopperStartError({
         userMessage:
           "macOS denied permission to send Apple Events to Hopper. Allow the application that starts REA under System Settings > Privacy & Security > Automation, then retry opening the target.",
+        launcherFailure,
+      });
+    }
+    if (hopperLauncherReportedApplicationNotFound(launcherFailure)) {
+      // Only the verified native helper's Spotlight exit precedes any target
+      // handoff. Wrappers can forward the same message after opening a document.
+      if (this.#resources.launch?.nativeHelperVerified === true)
+        this.#resources.shutdownConfirmed = true;
+      return new HopperStartError({
+        userMessage:
+          "Hopper's launcher could not find Hopper because it relies on Spotlight. Enable Spotlight indexing for the volume that contains Hopper (for example: sudo mdutil -i on /System/Volumes/Data), wait for indexing to finish, then retry opening the target.",
         launcherFailure,
       });
     }
